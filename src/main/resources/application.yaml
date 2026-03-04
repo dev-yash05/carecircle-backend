@@ -1,0 +1,180 @@
+# =============================================================================
+# CareCircle Backend — application.yml
+# SENIOR SIGNAL: We use YAML profiles. This file = shared config.
+# application-dev.yml = dev overrides, application-prod.yml = prod secrets.
+# Never hardcode passwords here. Use environment variables in prod.
+# =============================================================================
+
+spring:
+  application:
+    name: carecircle-backend
+
+  # ---------------------------------------------------------------------------
+  # DATABASE — PostgreSQL
+  # ---------------------------------------------------------------------------
+  datasource:
+    # 🧠 WHY THIS URL FORMAT?
+    # jdbc:postgresql://HOST:PORT/DATABASE_NAME
+    # localhost = your machine (or Docker container name in prod)
+    # 5432     = default Postgres port
+    # carecircle_db = the DB you'll create manually (see instructions below)
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}          # ⚠️ In prod: use ${DB_PASSWORD} env variable
+    driver-class-name: org.postgresql.Driver
+
+    # HikariCP = the connection pool Spring Boot uses by default
+    # 🧠 WHY A CONNECTION POOL?
+    # Opening a new DB connection takes ~100ms. A pool keeps connections
+    # open and reuses them. Without this, your app crawls under load.
+    hikari:
+      maximum-pool-size: 5     # Max simultaneous DB connections
+      minimum-idle: 1           # Keep 2 connections warm even when idle
+      connection-timeout: 30000 # Throw error if no connection in 30s
+      idle-timeout: 600000      # Close idle connections after 10 min
+
+  # ---------------------------------------------------------------------------
+  # JPA / HIBERNATE
+  # ---------------------------------------------------------------------------
+  jpa:
+    hibernate:
+      # 🧠 CRITICAL: Set this to 'validate' NOT 'update' or 'create'.
+      # 'update' lets Hibernate silently modify your DB schema — dangerous.
+      # 'validate' = Hibernate checks that your entities match the DB schema.
+      # Flyway owns schema changes. Hibernate just validates.
+      ddl-auto: validate
+    show-sql: true              # Logs every SQL query — turn OFF in prod
+    properties:
+      hibernate:
+        format_sql: true        # Makes logged SQL readable
+        preferred_uuid_jdbc_type: VARCHAR
+        # 🧠 JDBC Batching: Instead of 100 INSERT statements, send them
+        # in batches of 50. Massive performance boost for bulk operations.
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+      open-in-view: false
+
+  # ---------------------------------------------------------------------------
+  # FLYWAY — Database Version Control
+  # ---------------------------------------------------------------------------
+  flyway:
+    enabled: true
+    locations: classpath:db/migration   # Where to look for V1__, V2__ files
+    baseline-on-migrate: true           # Safe for first run on existing DB
+
+  # ---------------------------------------------------------------------------
+  # REDIS — Caching
+  # ---------------------------------------------------------------------------
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # password: ""            # Uncomment if your Redis has a password
+      timeout: 2000ms           # Fail fast if Redis is down — don't hang
+      lettuce:                  # Lettuce = the Redis client library used
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+
+  # ---------------------------------------------------------------------------
+  # RABBITMQ — Async Messaging (for Outbox Pattern + Notifications)
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest             # Default RabbitMQ credentials
+    password: guest             # ⚠️ Change in prod
+    virtual-host: /
+    # 🧠 WHY publisher-confirm-type?
+    # When your app sends a message to RabbitMQ, this setting makes
+    # RabbitMQ send back an ACK. If no ACK, your app knows to retry.
+    # This is what makes the Outbox Pattern reliable.
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    listener:
+      simple:
+        acknowledge-mode: manual  # Your code manually ACKs messages
+        retry:
+          enabled: true
+          max-attempts: 3         # Retry failed message processing 3 times
+          initial-interval: 2000  # Wait 2s before first retry
+
+  # ---------------------------------------------------------------------------
+  # CACHE — Tell Spring to use Redis as the cache provider
+  # ---------------------------------------------------------------------------
+  cache:
+    type: redis
+    redis:
+      time-to-live: 300000      # Cache entries expire after 5 minutes (ms)
+      cache-null-values: false  # Don't cache null results
+
+  # ---------------------------------------------------------------------------
+  # SECURITY — OAuth2 (Google Login)
+  # ---------------------------------------------------------------------------
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            # 🧠 Get these from Google Cloud Console:
+            # console.cloud.google.com → APIs & Services → Credentials
+            # Add redirect URI: http://localhost:8080/login/oauth2/code/google
+            client-id: ${GOOGLE_CLIENT_ID}       # Set as env variable
+            client-secret: ${GOOGLE_CLIENT_SECRET}
+            scope:
+              - email
+              - profile
+
+# =============================================================================
+# SERVER CONFIG
+# =============================================================================
+server:
+  port: 8080
+  # 🧠 Compression: Compresses API responses with gzip.
+  # A 100KB JSON payload becomes ~15KB. Faster for mobile clients.
+  compression:
+    enabled: true
+    mime-types: application/json,application/xml,text/plain
+    min-response-size: 1024     # Only compress responses > 1KB
+
+# =============================================================================
+# ACTUATOR — Health Checks & Metrics (for Prometheus/Grafana)
+# =============================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        # Expose these endpoints at /actuator/*
+        # health = is the app alive? (for Docker health checks)
+        # metrics = numbers for Prometheus to scrape
+        # info    = app version info
+        include: health, metrics, info, prometheus
+  endpoint:
+    health:
+      show-details: always      # Show DB, Redis, RabbitMQ status in /actuator/health
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+logging:
+  level:
+    com.carecircle: DEBUG       # Your code = verbose logging
+    org.springframework.security: DEBUG   # See auth flow during development
+    org.hibernate.SQL: DEBUG
+    root: INFO                  # Everything else = INFO only
+  pattern:
+    console: "%d{HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+# =============================================================================
+# NEXT STEPS:
+# 1. Install Docker Desktop
+# 2. Run: docker run --name carecircle-postgres -e POSTGRES_PASSWORD=postgres
+#         -e POSTGRES_DB=carecircle_db -p 5432:5432 -d postgres:16
+# 3. Run: docker run --name carecircle-redis -p 6379:6379 -d redis:7
+# 4. Run: docker run --name carecircle-rabbitmq -p 5672:5672 -p 15672:15672
+#         -d rabbitmq:3-management
+# 5. Run the Spring Boot app — Flyway will auto-create all tables from V1__.sql
+# =============================================================================

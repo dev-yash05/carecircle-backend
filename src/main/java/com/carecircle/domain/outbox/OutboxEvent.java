@@ -54,9 +54,11 @@ public class OutboxEvent {
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
+    @Builder.Default
     private OutboxStatus status = OutboxStatus.PENDING;
 
     @Column(name = "retry_count", nullable = false)
+    @Builder.Default
     private int retryCount = 0;
 
     @Column(name = "last_error", columnDefinition = "TEXT")

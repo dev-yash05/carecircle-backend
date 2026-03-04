@@ -53,5 +53,5 @@ public class Patient extends BaseEntity {
     private Map<String, Object> metadata = new HashMap<>();
 
     @Column(name = "is_active", nullable = false)
-    private boolean isActive = true;
+    private boolean active = true;
 }

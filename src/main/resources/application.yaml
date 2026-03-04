@@ -168,6 +168,13 @@ logging:
   pattern:
     console: "%d{HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
 
+app:
+  jwt:
+    secret: ${JWT_SECRET}
+    expiry-ms: ${JWT_EXPIRY_MS}
+    refresh-expiry-ms: ${JWT_REFRESH_EXPIRY_MS}
+  cors:
+    allowed-origins: http://localhost:3000
 # =============================================================================
 # NEXT STEPS:
 # 1. Install Docker Desktop

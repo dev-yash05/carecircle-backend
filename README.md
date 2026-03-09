@@ -3,7 +3,7 @@
 > **Production-grade family caregiving platform** built as a senior-engineer hiring signal project.  
 > Spring Boot 4 · PostgreSQL · Redis · RabbitMQ · Next.js (planned) · 8-week build
 
-[![Progress](https://img.shields.io/badge/Progress-Sprint%204%20(95%25)-yellow)](https://github.com/dev-yash05/carecircle-backend)
+[![Progress](https://img.shields.io/badge/Progress-Sprint%204%20Complete-brightgreen)](https://github.com/dev-yash05/carecircle-backend)
 [![Stack](https://img.shields.io/badge/Stack-Spring%20Boot%204%20%7C%20PostgreSQL%20%7C%20Redis%20%7C%20RabbitMQ-blue)](https://github.com/dev-yash05/carecircle-backend)
 [![Java](https://img.shields.io/badge/Java-21-orange)](https://github.com/dev-yash05/carecircle-backend)
 
@@ -44,8 +44,8 @@ Every architectural decision is chosen to demonstrate **senior-level engineering
 |--------|-------|
 | Total Sprints | 7 |
 | Timeline | 8 Weeks |
-| **Current Status** | **Sprint 4 — Medication Engine (95% complete)** |
-| Overall Progress | ~80% of core backend |
+| **Current Status** | **Sprint 5 — Performance (starting now)** |
+| Overall Progress | ~85% of core backend — Sprints 1–4 complete |
 | Repository | [dev-yash05/carecircle-backend](https://github.com/dev-yash05/carecircle-backend) |
 | Spring Boot | 4.0.3 |
 | Java | 21 |
@@ -313,12 +313,12 @@ GET    /actuator/prometheus               → Prometheus scrape endpoint
 Sprint 1 — Foundation        [██████████] 100%  ✅ COMPLETE
 Sprint 2 — Core APIs         [██████████] 100%  ✅ COMPLETE
 Sprint 3 — Security          [██████████] 100%  ✅ COMPLETE
-Sprint 4 — Medication Engine [█████████░]  95%  🔄 IN PROGRESS  ← current
-Sprint 5 — Performance       [░░░░░░░░░░]   0%  ⏳ NEXT
+Sprint 4 — Medication Engine [██████████] 100%  ✅ COMPLETE
+Sprint 5 — Performance       [░░░░░░░░░░]   0%  🔄 IN PROGRESS  ← current
 Sprint 6 — Product Features  [░░░░░░░░░░]   0%  ⏳ upcoming
 Sprint 7 — Production        [░░░░░░░░░░]   0%  ⏳ upcoming
 
-Overall: ████████████████░░░░  ~57%  (backend core mostly done)
+Overall: ██████████████████░░  ~57%  (4/7 sprints done)
 ```
 
 ---
@@ -401,7 +401,7 @@ JwtAuthFilter reads access_token cookie
 
 ---
 
-## 🔄 Sprint 4 — Medication Engine (Week 4) — 95% Complete
+## ✅ Sprint 4 — Medication Engine (Week 4) — COMPLETE
 
 | Task | Status | What Was Built |
 |------|--------|----------------|
@@ -413,6 +413,7 @@ JwtAuthFilter reads access_token cookie
 | RabbitMQ Publisher | ✅ | `OutboxPublisher` — polls every 5s, 3-retry limit, `lastError` stored, marks FAILED after max retries |
 | Dose Status API | ✅ | `markDose()` — validates PENDING→TAKEN/SKIPPED, `@Version` catches concurrent updates → 409 |
 | Dead Letter Queue | ✅ | `QueueBuilder.durable(...).withArgument("x-dead-letter-exchange", "carecircle.dlx")` |
+| **Auth Refresh Rotation** | ✅ | `AuthService.refresh()` + `AuthController` — `/auth/refresh`, `/auth/logout`, `/auth/me` |
 
 **The `markDose()` method — the crown jewel of Sprint 4:**
 ```java
@@ -428,13 +429,23 @@ public DoseEventDto.Response markDose(UUID doseEventId, MarkRequest request, Use
 }
 ```
 
-**⚠️ The remaining 5%:**
-- `POST /api/v1/auth/refresh` — refresh token rotation endpoint (controller + service) not yet built
-- Quartz library integration (currently using Spring `@Scheduled` + custom CRON parser — production would use `org.quartz.CronExpression` for full CRON spec compliance including `?`, `L`, `W`, `#` fields)
+**Auth endpoints added (`com/carecircle/security/`):**
+
+| File | What it does |
+|------|-------------|
+| `AuthService.java` | `refresh()` — hash → validate `isValid()` → `revokeAllByUserId()` → issue new pair → set cookies |
+| `AuthService.java` | `logout()` — revoke all tokens + clear both cookies with `MaxAge=0` |
+| `AuthController.java` | `POST /api/v1/auth/refresh` — `@CookieValue(required=false)` + delegates to `AuthService` |
+| `AuthController.java` | `POST /api/v1/auth/logout` — revoke + clear cookies |
+| `AuthController.java` | `GET /api/v1/auth/me` — returns current user from `@AuthenticationPrincipal` |
+
+**Replay attack protection built in:** If an attacker steals a refresh token and uses it first, the legitimate user's next `/auth/refresh` call finds the token already revoked → returns 401. The attack is detectable.
+
+**Note:** Quartz v2.5.2 is running (visible in startup logs). Currently using Spring `@Scheduled` for dose generation — full Quartz `CronExpression` integration is a future improvement for `L`, `W`, `#` CRON fields.
 
 ---
 
-## ⏳ Sprint 5 — Performance (Week 5) — UPCOMING
+## 🔄 Sprint 5 — Performance (Week 5) — IN PROGRESS
 
 **Goal:** Make the app fast under production load and resilient to abuse.
 
@@ -731,6 +742,6 @@ Build:
 ---
 
 *SENIOR HIRING SIGNAL PROJECT · 8 WEEKS · PRODUCTION GRADE*  
-*Last updated: Sprint 4 (95%) — Medication Engine + Outbox Pattern + OAuth2 + JWT complete*  
+*Last updated: Sprint 4 ✅ COMPLETE — Auth Refresh Rotation, Medication Engine, Outbox Pattern all done*  
 *Repo: https://github.com/dev-yash05/carecircle-backend*  
-*Next step: Complete `POST /api/v1/auth/refresh` → Start Sprint 5 (Redis Caching + Bucket4j)*
+*Next step: Start Sprint 5 — Redis `@Cacheable` + Bucket4j Rate Limiting*

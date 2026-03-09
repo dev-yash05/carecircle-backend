@@ -9,6 +9,14 @@ spring:
   application:
     name: carecircle-backend
 
+  quartz:
+    job-store-type: memory    # Store jobs in memory (fine for now)
+    properties:
+      org:
+        quartz:
+          threadPool:
+            threadCount: 5    # 5 threads for scheduled jobs
+
   # ---------------------------------------------------------------------------
   # DATABASE — PostgreSQL
   # ---------------------------------------------------------------------------
@@ -43,7 +51,7 @@ spring:
       # 'validate' = Hibernate checks that your entities match the DB schema.
       # Flyway owns schema changes. Hibernate just validates.
       ddl-auto: validate
-    show-sql: true              # Logs every SQL query — turn OFF in prod
+    show-sql: false              # Logs every SQL query — turn OFF in prod
     properties:
       hibernate:
         format_sql: true        # Makes logged SQL readable
@@ -99,8 +107,8 @@ spring:
         acknowledge-mode: manual  # Your code manually ACKs messages
         retry:
           enabled: true
-          max-attempts: 3         # Retry failed message processing 3 times
           initial-interval: 2000  # Wait 2s before first retry
+          max-retries: 3
 
   # ---------------------------------------------------------------------------
   # CACHE — Tell Spring to use Redis as the cache provider

@@ -54,5 +54,5 @@ public class MedicationSchedule extends BaseEntity {
     private LocalDate endDate;  // null = ongoing prescription
 
     @Column(name = "is_active", nullable = false)
-    private boolean isActive = true;
+    private boolean active = true;
 }

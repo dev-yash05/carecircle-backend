@@ -1,6 +1,6 @@
 # 🏥 CareCircle Backend
 
-> **Production-grade family caregiving platform** built as a senior-engineer hiring signal project.  
+> **Production-grade family caregiving platform.**  
 > Spring Boot 4 · PostgreSQL · Redis · RabbitMQ · Next.js (planned) · 8-week build
 
 [![Progress](https://img.shields.io/badge/Progress-Sprint%204%20Complete-brightgreen)](https://github.com/dev-yash05/carecircle-backend)

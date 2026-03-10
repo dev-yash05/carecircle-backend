@@ -1,0 +1,30 @@
+# =============================================================================
+# .dockerignore — excludes files from the Docker build context.
+#
+# 🧠 Without this, `docker build` sends your entire project directory to
+# the Docker daemon — including target/ (hundreds of MB of compiled classes),
+# .git/, and .env. This slows every build and risks leaking secrets.
+# =============================================================================
+
+# Maven build output — the build stage compiles fresh inside Docker
+target/
+
+# Git history — not needed in the image
+.git/
+.gitignore
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# Local environment secrets — NEVER goes into the image
+.env
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local Docker files (no need to send to daemon)
+docker-compose*.yml
+Dockerfile*

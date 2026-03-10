@@ -162,7 +162,8 @@ management:
         include: health, metrics, info, prometheus
   endpoint:
     health:
-      show-details: always      # Show DB, Redis, RabbitMQ status in /actuator/health
+      show-details: always
+      show-components: always
 
 # =============================================================================
 # LOGGING

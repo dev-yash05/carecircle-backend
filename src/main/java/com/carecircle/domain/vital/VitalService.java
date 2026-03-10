@@ -29,13 +29,11 @@ public class VitalService {
     private final OutboxEventRepository outboxEventRepository;
 
     // -------------------------------------------------------------------------
-    // RECORD VITAL — with inline anomaly detection + outbox alert
+    // RECORD VITAL — with anomaly detection + outbox alert
     // -------------------------------------------------------------------------
     @Transactional
     public VitalDto.Response recordVital(UUID orgId, UUID patientId,
-                                         VitalDto.CreateRequest request,
-                                         User recordedBy) {
-
+                                         VitalDto.CreateRequest request, User recordedBy) {
         Patient patient = patientRepository
                 .findByIdAndOrganizationId(patientId, orgId)
                 .orElseThrow(() -> new ResourceNotFoundException("Patient", patientId));
@@ -44,8 +42,7 @@ public class VitalService {
         try {
             vitalType = VitalReading.VitalType.valueOf(request.getVitalType().toUpperCase());
         } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("Invalid vital type: " + request.getVitalType() +
-                    ". Valid types: BLOOD_PRESSURE, BLOOD_SUGAR, WEIGHT, SPO2, TEMPERATURE");
+            throw new IllegalArgumentException("Invalid vital type: " + request.getVitalType());
         }
 
         AnomalyResult anomaly = detectAnomaly(vitalType, request.getReadingValue());
@@ -62,31 +59,23 @@ public class VitalService {
 
         VitalReading saved = vitalReadingRepository.save(reading);
 
-        // If anomalous — write OutboxEvent in SAME transaction (Outbox Pattern)
-        // 🧠 Same guarantee as DOSE_TAKEN: if this transaction commits, the alert
-        // is guaranteed to be delivered eventually via OutboxPublisher → RabbitMQ.
+        // Write OutboxEvent in SAME @Transactional — Transactional Outbox Pattern
         if (anomaly.anomalous) {
-            log.warn("ANOMALY DETECTED for patient: {} | type: {} | reason: {}",
-                    patientId, vitalType, anomaly.reason);
+            log.warn("ANOMALY: patient={} type={} reason={}", patientId, vitalType, anomaly.reason);
 
-            Map<String, Object> alertPayload = new HashMap<>(request.getReadingValue());
-            alertPayload.put("vitalReadingId", saved.getId().toString());
-            alertPayload.put("patientId", patientId.toString());
-            alertPayload.put("patientName", patient.getFullName());
-            alertPayload.put("vitalType", vitalType.name());
-            alertPayload.put("anomalyReason", anomaly.reason);
-            alertPayload.put("recordedBy", recordedBy.getFullName());
-            alertPayload.put("measuredAt", saved.getMeasuredAt().toString());
-            alertPayload.put("organizationId", orgId.toString());
+            Map<String, Object> payload = new HashMap<>(request.getReadingValue());
+            payload.put("vitalReadingId", saved.getId().toString());
+            payload.put("patientId", patientId.toString());
+            payload.put("patientName", patient.getFullName());
+            payload.put("vitalType", vitalType.name());
+            payload.put("anomalyReason", anomaly.reason);
+            payload.put("recordedBy", recordedBy.getFullName());
+            payload.put("measuredAt", saved.getMeasuredAt().toString());
+            payload.put("organizationId", orgId.toString());
 
-            outboxEventRepository.save(OutboxEvent.of(
-                    "VitalReading",
-                    saved.getId(),
-                    "BP_ANOMALY_DETECTED",
-                    alertPayload
-            ));
-
-            log.info("BP_ANOMALY_DETECTED outbox event written for patient: {}", patientId);
+            outboxEventRepository.save(
+                    OutboxEvent.of("VitalReading", saved.getId(), "BP_ANOMALY_DETECTED", payload)
+            );
         }
 
         return toResponse(saved);
@@ -114,72 +103,46 @@ public class VitalService {
     }
 
     // -------------------------------------------------------------------------
-    // ANOMALY DETECTION ENGINE
+    // ANOMALY DETECTION
     // -------------------------------------------------------------------------
     private AnomalyResult detectAnomaly(VitalReading.VitalType type, Map<String, Object> value) {
         try {
             return switch (type) {
-                case BLOOD_PRESSURE -> detectBpAnomaly(value);
-                case BLOOD_SUGAR    -> detectBloodSugarAnomaly(value);
-                case SPO2           -> detectSpo2Anomaly(value);
-                case TEMPERATURE    -> detectTempAnomaly(value);
-                case WEIGHT         -> AnomalyResult.normal();
+                case BLOOD_PRESSURE -> {
+                    int sys = toInt(value.get("systolic"));
+                    int dia = toInt(value.get("diastolic"));
+                    if (sys > 160) yield AnomalyResult.of("Systolic BP critically high: " + sys + " mmHg (>160)");
+                    if (dia > 100) yield AnomalyResult.of("Diastolic BP high: " + dia + " mmHg (>100)");
+                    yield AnomalyResult.normal();
+                }
+                case BLOOD_SUGAR -> {
+                    double g = toDouble(value.get("value"));
+                    yield g > 250 ? AnomalyResult.of("Blood sugar high: " + g + " mg/dL (>250)") : AnomalyResult.normal();
+                }
+                case SPO2 -> {
+                    double s = toDouble(value.get("value"));
+                    yield s < 92 ? AnomalyResult.of("SpO2 critically low: " + s + "% (<92)") : AnomalyResult.normal();
+                }
+                case TEMPERATURE -> {
+                    double t = toDouble(value.get("value"));
+                    yield t > 38.5 ? AnomalyResult.of("Fever: " + t + "°C (>38.5)") : AnomalyResult.normal();
+                }
+                case WEIGHT -> AnomalyResult.normal();
             };
         } catch (Exception e) {
-            log.warn("Could not evaluate anomaly for type: {} — {}", type, e.getMessage());
+            log.warn("Could not evaluate anomaly for {} — {}", type, e.getMessage());
             return AnomalyResult.normal();
         }
     }
 
-    private AnomalyResult detectBpAnomaly(Map<String, Object> value) {
-        int systolic  = toInt(value.get("systolic"));
-        int diastolic = toInt(value.get("diastolic"));
-        if (systolic > 160) {
-            return AnomalyResult.of("Systolic BP critically high: " + systolic + " mmHg (threshold: >160)");
-        }
-        if (diastolic > 100) {
-            return AnomalyResult.of("Diastolic BP high: " + diastolic + " mmHg (threshold: >100)");
-        }
-        return AnomalyResult.normal();
+    private int toInt(Object v) {
+        if (v instanceof Number n) return n.intValue();
+        return Integer.parseInt(v.toString());
     }
 
-    private AnomalyResult detectBloodSugarAnomaly(Map<String, Object> value) {
-        double glucose = toDouble(value.get("value"));
-        if (glucose > 250) {
-            return AnomalyResult.of("Blood sugar dangerously high: " + glucose + " mg/dL (threshold: >250)");
-        }
-        return AnomalyResult.normal();
-    }
-
-    private AnomalyResult detectSpo2Anomaly(Map<String, Object> value) {
-        double spo2 = toDouble(value.get("value"));
-        if (spo2 < 92) {
-            return AnomalyResult.of("SpO2 critically low: " + spo2 + "% (threshold: <92%)");
-        }
-        return AnomalyResult.normal();
-    }
-
-    private AnomalyResult detectTempAnomaly(Map<String, Object> value) {
-        double temp = toDouble(value.get("value"));
-        if (temp > 38.5) {
-            return AnomalyResult.of("Fever detected: " + temp + "°C (threshold: >38.5°C)");
-        }
-        return AnomalyResult.normal();
-    }
-
-    // -------------------------------------------------------------------------
-    // HELPERS
-    // -------------------------------------------------------------------------
-    private int toInt(Object val) {
-        if (val instanceof Integer i) return i;
-        if (val instanceof Number n) return n.intValue();
-        return Integer.parseInt(val.toString());
-    }
-
-    private double toDouble(Object val) {
-        if (val instanceof Double d) return d;
-        if (val instanceof Number n) return n.doubleValue();
-        return Double.parseDouble(val.toString());
+    private double toDouble(Object v) {
+        if (v instanceof Number n) return n.doubleValue();
+        return Double.parseDouble(v.toString());
     }
 
     private VitalDto.Response toResponse(VitalReading v) {
@@ -197,29 +160,12 @@ public class VitalService {
                 .build();
     }
 
-    // -------------------------------------------------------------------------
-    // INNER CLASS: AnomalyResult
-    // -------------------------------------------------------------------------
-    // 🧠 FIX: The previous version used @lombok.Value on this inner class.
-    // @lombok.Value generates a final class with all-args constructor + getters,
-    // but it CONFLICTS with Spring's @org.springframework.beans.factory.annotation.Value
-    // annotation at compile time — both are named @Value and the processor gets confused.
-    // Solution: write the class manually. It's only 3 fields — no Lombok needed here.
+    // Plain inner class — avoids @lombok.Value vs Spring @Value conflict
     private static final class AnomalyResult {
         final boolean anomalous;
         final String reason;
-
-        private AnomalyResult(boolean anomalous, String reason) {
-            this.anomalous = anomalous;
-            this.reason = reason;
-        }
-
-        static AnomalyResult normal() {
-            return new AnomalyResult(false, null);
-        }
-
-        static AnomalyResult of(String reason) {
-            return new AnomalyResult(true, reason);
-        }
+        private AnomalyResult(boolean a, String r) { this.anomalous = a; this.reason = r; }
+        static AnomalyResult normal() { return new AnomalyResult(false, null); }
+        static AnomalyResult of(String r) { return new AnomalyResult(true, r); }
     }
 }

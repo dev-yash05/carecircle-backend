@@ -14,29 +14,16 @@ import java.util.UUID;
 @Repository
 public interface VitalReadingRepository extends JpaRepository<VitalReading, UUID> {
 
-    // Time-series: all readings of one type for a patient, newest first
-    // Used for charting trends (e.g. BP over last 30 days)
+    // Time-series for a specific vital type — used for charting + GET API
     Page<VitalReading> findByPatientIdAndVitalTypeOrderByMeasuredAtDesc(
-            UUID patientId,
-            VitalReading.VitalType vitalType,
-            Pageable pageable
-    );
+            UUID patientId, VitalReading.VitalType vitalType, Pageable pageable);
 
-    // All readings for a patient in a time window — used for PDF report generation (Sprint 6)
+    // All readings in a time window — used by PDF report generator
     @Query("SELECT v FROM VitalReading v WHERE v.patient.id = :patientId " +
-            "AND v.measuredAt BETWEEN :from AND :to " +
-            "ORDER BY v.measuredAt DESC")
+            "AND v.measuredAt BETWEEN :from AND :to ORDER BY v.measuredAt DESC")
     List<VitalReading> findByPatientIdInWindow(
             @Param("patientId") UUID patientId,
             @Param("from") Instant from,
             @Param("to") Instant to
-    );
-
-    // Anomalous readings that haven't triggered an alert yet
-    // Polled by a background job in case outbox processing was delayed
-    List<VitalReading> findByPatientIdAndAnomalousAndAlertTriggered(
-            UUID patientId,
-            boolean anomalous,
-            boolean alertTriggered
     );
 }

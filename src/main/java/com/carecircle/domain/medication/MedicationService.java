@@ -1,6 +1,5 @@
 package com.carecircle.domain.medication;
 
-import com.carecircle.config.CacheConfig;
 import com.carecircle.domain.medication.dto.DoseEventDto;
 import com.carecircle.domain.medication.dto.MedicationDto;
 import com.carecircle.domain.outbox.OutboxEvent;
@@ -11,17 +10,14 @@ import com.carecircle.domain.user.User;
 import com.carecircle.shared.exception.ResourceNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.CacheManager;
-import org.springframework.cache.annotation.CacheEvict;
-import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
-import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -35,13 +31,14 @@ public class MedicationService {
     private final DoseEventRepository doseEventRepository;
     private final PatientRepository patientRepository;
     private final OutboxEventRepository outboxEventRepository;
-    private final CacheManager cacheManager;
+    // 🧠 SimpMessagingTemplate: Spring's API for server-push to STOMP topics.
+    // Spring auto-creates this bean when @EnableWebSocketMessageBroker is present.
+    private final SimpMessagingTemplate messagingTemplate;
 
     // -------------------------------------------------------------------------
     // CREATE MEDICATION SCHEDULE
     // -------------------------------------------------------------------------
     @Transactional
-    @CacheEvict(value = CacheConfig.MED_SCHEDULES_CACHE, key = "#orgId + ':' + #request.patientId")
     public MedicationDto.Response createSchedule(UUID orgId, MedicationDto.CreateRequest request,
                                                  User createdBy) {
         Patient patient = patientRepository
@@ -71,10 +68,7 @@ public class MedicationService {
     // GET SCHEDULES FOR PATIENT
     // -------------------------------------------------------------------------
     @Transactional(readOnly = true)
-    @Cacheable(value = CacheConfig.MED_SCHEDULES_CACHE, key = "#orgId + ':' + #patientId")
     public List<MedicationDto.Response> getSchedules(UUID orgId, UUID patientId) {
-        log.debug("Cache MISS — fetching schedules from DB for patient: {}", patientId);
-
         patientRepository.findByIdAndOrganizationId(patientId, orgId)
                 .orElseThrow(() -> new ResourceNotFoundException("Patient", patientId));
 
@@ -91,9 +85,6 @@ public class MedicationService {
     @Transactional
     public DoseEventDto.Response markDose(UUID doseEventId, DoseEventDto.MarkRequest request,
                                           User actionedBy) {
-        // 🧠 Uses the overridden findById() which has @EntityGraph —
-        // fetches schedule + patient + actionedBy in ONE JOIN query.
-        // No lazy-load chains when toDoseResponse() accesses associations.
         DoseEvent dose = doseEventRepository.findById(doseEventId)
                 .orElseThrow(() -> new ResourceNotFoundException("DoseEvent", doseEventId));
 
@@ -126,8 +117,8 @@ public class MedicationService {
                     "This dose was already updated by another user. Please refresh.");
         }
 
-        // Transactional Outbox — same @Transactional as the dose save
-        OutboxEvent outboxEvent = OutboxEvent.of(
+        // Transactional Outbox — reliable async delivery via RabbitMQ
+        outboxEventRepository.save(OutboxEvent.of(
                 "DoseEvent",
                 saved.getId(),
                 newStatus == DoseEvent.DoseStatus.TAKEN ? "DOSE_TAKEN" : "DOSE_SKIPPED",
@@ -140,47 +131,51 @@ public class MedicationService {
                         "actionedAt", saved.getActionedAt().toString(),
                         "status", newStatus.name()
                 )
+        ));
+
+        // ─── WEBSOCKET PUSH ───────────────────────────────────────────────────
+        // 🧠 WHY BOTH Outbox AND WebSocket?
+        //
+        //   Outbox  → reliability guarantee. Survives RabbitMQ downtime.
+        //             The notification-module eventually delivers the alert.
+        //
+        //   WebSocket → speed. Connected dashboards see the update in <50ms.
+        //               Best-effort — if the client disconnects, they miss it,
+        //               but their next page load fetches current state from DB.
+        //
+        // Topic is org-scoped: only caregivers in this org see the update.
+        UUID orgId = saved.getPatient().getOrganization().getId();
+        messagingTemplate.convertAndSend(
+                "/topic/org/" + orgId + "/dashboard",
+                (Object) Map.of(
+                        "event",          "DOSE_UPDATED",
+                        "doseEventId",    saved.getId().toString(),
+                        "patientId",      saved.getPatient().getId().toString(),
+                        "patientName",    saved.getPatient().getFullName(),
+                        "medicationName", saved.getSchedule().getMedicationName(),
+                        "status",         newStatus.name(),
+                        "actionedBy",     actionedBy.getFullName(),
+                        "actionedAt",     saved.getActionedAt().toString()
+                )
         );
-        outboxEventRepository.save(outboxEvent);
-
-        evictDoseEventsCache(saved.getPatient().getId());
-
-        log.info("Dose {} marked as {} by user {}",
-                doseEventId, newStatus, actionedBy.getEmail());
+        log.info("WebSocket push → /topic/org/{}/dashboard | dose: {} → {}",
+                orgId, doseEventId, newStatus);
+        // ─────────────────────────────────────────────────────────────────────
 
         return toDoseResponse(saved);
     }
 
     // -------------------------------------------------------------------------
-    // GET DOSE EVENTS FOR PATIENT (paginated + cached)
+    // GET DOSE EVENTS FOR PATIENT (paginated)
     // -------------------------------------------------------------------------
     @Transactional(readOnly = true)
-    @Cacheable(
-            value = CacheConfig.DOSE_EVENTS_CACHE,
-            key = "#orgId + ':' + #patientId + ':' + T(java.time.LocalDate).now()"
-    )
     public Page<DoseEventDto.Response> getDoseEvents(UUID orgId, UUID patientId, Pageable pageable) {
-        log.debug("Cache MISS — fetching dose events from DB for patient: {}", patientId);
-
         patientRepository.findByIdAndOrganizationId(patientId, orgId)
                 .orElseThrow(() -> new ResourceNotFoundException("Patient", patientId));
 
-        // 🧠 findByPatientIdOrderByScheduledAtDesc now has @EntityGraph —
-        // all associations loaded in one JOIN, no N+1.
         return doseEventRepository
                 .findByPatientIdOrderByScheduledAtDesc(patientId, pageable)
                 .map(this::toDoseResponse);
-    }
-
-    // -------------------------------------------------------------------------
-    // PROGRAMMATIC CACHE EVICTION
-    // -------------------------------------------------------------------------
-    private void evictDoseEventsCache(UUID patientId) {
-        var cache = cacheManager.getCache(CacheConfig.DOSE_EVENTS_CACHE);
-        if (cache != null) {
-            cache.evict(patientId + ":" + LocalDate.now());
-            log.debug("Evicted dose_events cache for patient: {}", patientId);
-        }
     }
 
     // -------------------------------------------------------------------------

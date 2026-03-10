@@ -1,5 +1,6 @@
 package com.carecircle.domain.medication;
 
+import com.carecircle.config.CacheConfig;
 import com.carecircle.domain.medication.dto.DoseEventDto;
 import com.carecircle.domain.medication.dto.MedicationDto;
 import com.carecircle.domain.outbox.OutboxEvent;
@@ -10,6 +11,9 @@ import com.carecircle.domain.user.User;
 import com.carecircle.shared.exception.ResourceNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
@@ -17,6 +21,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.time.LocalDate;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -29,11 +35,13 @@ public class MedicationService {
     private final DoseEventRepository doseEventRepository;
     private final PatientRepository patientRepository;
     private final OutboxEventRepository outboxEventRepository;
+    private final CacheManager cacheManager;
 
     // -------------------------------------------------------------------------
     // CREATE MEDICATION SCHEDULE
     // -------------------------------------------------------------------------
     @Transactional
+    @CacheEvict(value = CacheConfig.MED_SCHEDULES_CACHE, key = "#orgId + ':' + #request.patientId")
     public MedicationDto.Response createSchedule(UUID orgId, MedicationDto.CreateRequest request,
                                                  User createdBy) {
         Patient patient = patientRepository
@@ -63,7 +71,10 @@ public class MedicationService {
     // GET SCHEDULES FOR PATIENT
     // -------------------------------------------------------------------------
     @Transactional(readOnly = true)
-    public java.util.List<MedicationDto.Response> getSchedules(UUID orgId, UUID patientId) {
+    @Cacheable(value = CacheConfig.MED_SCHEDULES_CACHE, key = "#orgId + ':' + #patientId")
+    public List<MedicationDto.Response> getSchedules(UUID orgId, UUID patientId) {
+        log.debug("Cache MISS — fetching schedules from DB for patient: {}", patientId);
+
         patientRepository.findByIdAndOrganizationId(patientId, orgId)
                 .orElseThrow(() -> new ResourceNotFoundException("Patient", patientId));
 
@@ -77,24 +88,20 @@ public class MedicationService {
     // -------------------------------------------------------------------------
     // MARK DOSE AS TAKEN / SKIPPED
     // -------------------------------------------------------------------------
-    // 🧠 THIS IS THE MOST IMPORTANT METHOD — IT DEMONSTRATES:
-    // 1. Optimistic Locking (handles concurrent updates)
-    // 2. Transactional Outbox Pattern (guaranteed notification delivery)
-    // 3. @Transactional (atomic — both updates succeed or both roll back)
     @Transactional
     public DoseEventDto.Response markDose(UUID doseEventId, DoseEventDto.MarkRequest request,
                                           User actionedBy) {
-        // 1. Fetch the dose event
+        // 🧠 Uses the overridden findById() which has @EntityGraph —
+        // fetches schedule + patient + actionedBy in ONE JOIN query.
+        // No lazy-load chains when toDoseResponse() accesses associations.
         DoseEvent dose = doseEventRepository.findById(doseEventId)
                 .orElseThrow(() -> new ResourceNotFoundException("DoseEvent", doseEventId));
 
-        // 2. Validate — can't mark a dose that's already been actioned
         if (dose.getStatus() != DoseEvent.DoseStatus.PENDING) {
             throw new IllegalStateException(
                     "Dose is already " + dose.getStatus() + ". Cannot update.");
         }
 
-        // 3. Validate the new status
         DoseEvent.DoseStatus newStatus;
         try {
             newStatus = DoseEvent.DoseStatus.valueOf(request.getStatus());
@@ -106,29 +113,20 @@ public class MedicationService {
             throw new IllegalArgumentException("Can only mark as TAKEN or SKIPPED");
         }
 
-        // 4. Update dose status
         dose.setStatus(newStatus);
         dose.setActionedBy(actionedBy);
         dose.setActionedAt(Instant.now());
         dose.setNotes(request.getNotes());
 
-        // 5. Save — Hibernate increments @Version automatically
-        // If another request already updated this dose, Hibernate throws
-        // ObjectOptimisticLockingFailureException → caught below
         DoseEvent saved;
         try {
             saved = doseEventRepository.save(dose);
         } catch (ObjectOptimisticLockingFailureException e) {
-            // 🧠 TWO caregivers tried to mark the same dose simultaneously.
-            // The first one wins. The second gets a 409 Conflict.
             throw new IllegalStateException(
                     "This dose was already updated by another user. Please refresh.");
         }
 
-        // 6. TRANSACTIONAL OUTBOX PATTERN
-        // In the SAME transaction: insert an outbox event.
-        // If this transaction commits → both the dose update AND the outbox
-        // event are saved atomically. No notification can be lost.
+        // Transactional Outbox — same @Transactional as the dose save
         OutboxEvent outboxEvent = OutboxEvent.of(
                 "DoseEvent",
                 saved.getId(),
@@ -145,6 +143,8 @@ public class MedicationService {
         );
         outboxEventRepository.save(outboxEvent);
 
+        evictDoseEventsCache(saved.getPatient().getId());
+
         log.info("Dose {} marked as {} by user {}",
                 doseEventId, newStatus, actionedBy.getEmail());
 
@@ -152,20 +152,39 @@ public class MedicationService {
     }
 
     // -------------------------------------------------------------------------
-    // GET DOSE EVENTS FOR PATIENT (paginated)
+    // GET DOSE EVENTS FOR PATIENT (paginated + cached)
     // -------------------------------------------------------------------------
     @Transactional(readOnly = true)
+    @Cacheable(
+            value = CacheConfig.DOSE_EVENTS_CACHE,
+            key = "#orgId + ':' + #patientId + ':' + T(java.time.LocalDate).now()"
+    )
     public Page<DoseEventDto.Response> getDoseEvents(UUID orgId, UUID patientId, Pageable pageable) {
+        log.debug("Cache MISS — fetching dose events from DB for patient: {}", patientId);
+
         patientRepository.findByIdAndOrganizationId(patientId, orgId)
                 .orElseThrow(() -> new ResourceNotFoundException("Patient", patientId));
 
+        // 🧠 findByPatientIdOrderByScheduledAtDesc now has @EntityGraph —
+        // all associations loaded in one JOIN, no N+1.
         return doseEventRepository
                 .findByPatientIdOrderByScheduledAtDesc(patientId, pageable)
                 .map(this::toDoseResponse);
     }
 
     // -------------------------------------------------------------------------
-    // MAPPERS (inline — no MapStruct needed for these since logic is custom)
+    // PROGRAMMATIC CACHE EVICTION
+    // -------------------------------------------------------------------------
+    private void evictDoseEventsCache(UUID patientId) {
+        var cache = cacheManager.getCache(CacheConfig.DOSE_EVENTS_CACHE);
+        if (cache != null) {
+            cache.evict(patientId + ":" + LocalDate.now());
+            log.debug("Evicted dose_events cache for patient: {}", patientId);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // MAPPERS
     // -------------------------------------------------------------------------
     private MedicationDto.Response toScheduleResponse(MedicationSchedule s) {
         return MedicationDto.Response.builder()

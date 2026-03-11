@@ -45,6 +45,7 @@ spring:
   # JPA / HIBERNATE
   # ---------------------------------------------------------------------------
   jpa:
+    open-in-view: false
     hibernate:
       # 🧠 CRITICAL: Set this to 'validate' NOT 'update' or 'create'.
       # 'update' lets Hibernate silently modify your DB schema — dangerous.

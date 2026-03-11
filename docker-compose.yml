@@ -1,134 +1,147 @@
 # =============================================================================
-# CareCircle — docker-compose.yml
+# CareCircle — docker-compose.yml (Production-Ready)
 #
-# 🧠 HEALTH CHECK STRATEGY
-# Docker's depends_on with condition: service_healthy ensures the app container
-# doesn't start until Postgres, Redis, and RabbitMQ pass their health checks.
-# Without this, Spring Boot starts, tries to connect to Postgres before it's
-# ready to accept connections, and crashes with "Connection refused".
+# Architecture:
+#   PostgreSQL  → Neon cloud (external) — NOT a local container
+#   Redis       → local container       — caching + rate limiting
+#   RabbitMQ    → local container       — outbox event relay
+#   App         → built from Dockerfile
 #
-# Each health check uses the service's own CLI tool — the most reliable signal
-# that the service is actually ready to accept traffic (not just "running").
+# First run:
+#   cp .env.example .env        # fill in your secrets
+#   docker compose up --build   # builds image + starts all services
 #
-# Usage:
-#   cp .env.example .env          # fill in your secrets
-#   docker compose up --build     # first run (builds the Spring Boot image)
-#   docker compose up             # subsequent runs (uses cached image)
-#   docker compose down -v        # stop + delete volumes (fresh DB)
+# Subsequent runs (no code changes):
+#   docker compose up -d
+#
+# After code changes:
+#   docker compose up --build -d
+#
+# Full reset (wipes Redis + RabbitMQ data):
+#   docker compose down -v
 # =============================================================================
 
 services:
 
-  # ── PostgreSQL 17 ───────────────────────────────────────────────────────────
-  postgres:
-    image: postgres:17-alpine
-    container_name: carecircle-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB:       ${DB_NAME:-carecircle_db}
-      POSTGRES_USER:     ${DB_USERNAME}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-    ports:
-      - "5432:5432"
-    volumes:
-      # Named volume: data persists across `docker compose down` (but not down -v)
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      # pg_isready checks that Postgres is accepting TCP connections.
-      # -U and -d ensure it's the right DB, not just the daemon socket.
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_NAME:-carecircle_db}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s   # Grace period before first check — PG init takes time
-
-  # ── Redis 7 ─────────────────────────────────────────────────────────────────
+  # ── Redis 7 ──────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: carecircle-redis
     restart: unless-stopped
-    # 🧠 requirepass sets the Redis password via CLI flag, matching
-    # the REDIS_PASSWORD env var read by the Spring Boot app.
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    # 🧠 Password must be passed as a CLI flag to redis-server.
+    # The vanilla redis:7-alpine image does NOT read REDIS_PASSWORD env var.
+    # Without this flag the server starts with no auth — anyone can connect.
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    #                                                      ↑
+    # --appendonly yes: enables AOF persistence. Redis writes every command
+    # to disk. On restart, it replays the log — rate limit buckets and cache
+    # entries survive container restarts. Remove if you want ephemeral cache.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    # 🧠 Binding to 127.0.0.1 (not 0.0.0.0) means Redis is only accessible
+    # from the host machine — not from the public internet.
+    # The app container reaches it via Docker's internal network (no port needed).
     volumes:
       - redis_data:/data
     healthcheck:
-      # redis-cli ping returns "PONG" when Redis is ready.
-      # -a passes the password so AUTH doesn't fail the health check.
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      # -a passes the password so AUTH doesn't fail the health check itself.
+      # Without -a, redis-cli ping returns NOAUTH and the check fails.
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 5s
 
-  # ── RabbitMQ 3 (with Management UI) ─────────────────────────────────────────
+  # ── RabbitMQ 3 ───────────────────────────────────────────────────────────────
   rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: carecircle-rabbitmq
     restart: unless-stopped
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_USER:  ${RABBITMQ_USERNAME}
+      RABBITMQ_DEFAULT_PASS:  ${RABBITMQ_PASSWORD}
       RABBITMQ_DEFAULT_VHOST: /
     ports:
-      - "5672:5672"    # AMQP (Spring Boot connects here)
-      - "15672:15672"  # Management UI → http://localhost:15672
+      - "127.0.0.1:5672:5672"     # AMQP — app connects here
+      - "127.0.0.1:15672:15672"   # Management UI → http://localhost:15672
+    # 🧠 Both ports bound to 127.0.0.1 — not publicly exposed.
+    # The Spring Boot app connects via Docker internal network on port 5672.
+    # You access the management UI from your laptop browser only.
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      # rabbitmq-diagnostics check_port_connectivity is the official
-      # lightweight readiness probe — faster than rabbitmqctl status.
+      # check_port_connectivity is the official lightweight readiness probe.
+      # Faster and more reliable than rabbitmqctl status for health checks.
       test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
       interval: 15s
       timeout: 10s
       retries: 5
-      start_period: 20s  # RabbitMQ is the slowest to boot — give it time
+      start_period: 30s   # RabbitMQ boots slower than Redis — give it time
 
-  # ── Spring Boot App ──────────────────────────────────────────────────────────
+  # ── Spring Boot App ───────────────────────────────────────────────────────────
   app:
     build:
       context: .
       dockerfile: Dockerfile
+    image: carecircle-backend-app:latest
     container_name: carecircle-app
     restart: unless-stopped
-    # 🧠 env_file loads all variables from .env into the container environment.
-    # application-prod.yml reads them via ${VAR_NAME} Spring placeholders.
     env_file: .env
+    # 🧠 env_file loads everything from .env first (DB_URL, JWT, Google creds).
+    # The environment: block below OVERRIDES specific keys from .env.
+    # This is intentional — service hostnames must use Docker DNS names
+    # (redis, rabbitmq), not localhost or whatever is in .env.
     environment:
-      # Activate the prod profile — loads application-prod.yml on top of application.yaml
+      # Activate prod profile → loads application-prod.yml on top of application.yaml
       SPRING_PROFILES_ACTIVE: prod
-      # Override DB URL to point at the Docker service name, not localhost
-      DB_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-carecircle_db}
-      # Redis host override — 'redis' is the service name Docker DNS resolves
+
+      # 🧠 DB_URL points directly to Neon cloud — no local Postgres container.
+      # Read from .env. No override needed here.
+      # DB_URL: set in .env — do not override here
+
+      # Redis — override host to Docker service name, keep password from .env
       SPRING_DATA_REDIS_HOST: redis
-      SPRING_DATA_REDIS_PORT: 6379
-      # RabbitMQ host override
-      SPRING_RABBITMQ_HOST: rabbitmq
-      SPRING_RABBITMQ_PORT: 5672
+      SPRING_DATA_REDIS_PORT: "6379"
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+      # RabbitMQ — override host + credentials to Docker service name
+      SPRING_RABBITMQ_HOST:     rabbitmq
+      SPRING_RABBITMQ_PORT:     "5672"
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USERNAME}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+
+      # JVM tuning — tell Spring to use the container timezone
+      TZ: Asia/Kolkata
     ports:
       - "8080:8080"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
-        condition: service_healthy
+        condition: service_healthy   # wait for PONG before starting app
       rabbitmq:
-        condition: service_healthy
+        condition: service_healthy   # wait for AMQP port before starting app
+    # 🧠 No depends_on for Postgres — Neon is external and always available.
+    # If Neon is down, the app will fail on startup anyway — no health gate needed.
     healthcheck:
-      # Spring Actuator /actuator/health returns 200 when the app is UP.
-      # wget is available in Alpine; curl is not (keeps image tiny).
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      # wget is available in Alpine (our runtime image). curl is not.
+      # -q = quiet, -O- = output to stdout, || exit 1 = fail if app is down.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q '\"status\":\"UP\"' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s  # Spring Boot + Flyway migrations need time on first boot
+      start_period: 90s
+      # 🧠 90s start_period: Spring Boot + Flyway migration on Neon (cloud DB
+      # with network latency) takes longer than a local DB. The health check
+      # doesn't count failures during start_period — prevents false restarts.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"   # rotate log file at 10MB
+        max-file: "3"     # keep last 3 rotated files = max 30MB per container
 
 # ── Named Volumes ──────────────────────────────────────────────────────────────
-# Named volumes persist data between container restarts.
-# `docker compose down` keeps them. `docker compose down -v` removes them.
+# Persist Redis AOF data and RabbitMQ queue state across restarts.
+# docker compose down       → volumes survive
+# docker compose down -v    → volumes deleted (full reset)
 volumes:
-  postgres_data:
   redis_data:
   rabbitmq_data:

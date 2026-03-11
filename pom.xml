@@ -11,7 +11,7 @@
 	<groupId>com.carecircle</groupId>
 	<artifactId>carecircle-backend</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<n>carecircle-backend</n>
+	<name>carecircle-backend</name>
 	<description>CareCircle — family caregiving coordination platform</description>
 	<url/>
 	<licenses><license/></licenses>

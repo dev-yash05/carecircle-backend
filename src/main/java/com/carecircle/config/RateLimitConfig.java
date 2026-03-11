@@ -46,10 +46,17 @@ public class RateLimitConfig {
     @Value("${spring.data.redis.port:6379}")
     private int redisPort;
 
+    @Value("${spring.data.redis.password:}") // Add this field
+    private String redisPassword;
+
     @Bean
     public StatefulRedisConnection<String, byte[]> redisConnectionForBucket4j() {
-        RedisClient redisClient = RedisClient.create("redis://" + redisHost + ":" + redisPort);
-        // String keys (for readability in redis-cli) + byte[] values (Bucket4j's binary state)
+        // Construct URI with password if it exists
+        String redisUri = redisPassword.isEmpty()
+                ? String.format("redis://%s:%d", redisHost, redisPort)
+                : String.format("redis://:%s@%s:%d", redisPassword, redisHost, redisPort);
+
+        RedisClient redisClient = RedisClient.create(redisUri);
         return redisClient.connect(RedisCodec.of(StringCodec.UTF8, ByteArrayCodec.INSTANCE));
     }
 

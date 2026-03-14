@@ -8,6 +8,7 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.time.Instant;
 import java.util.HashMap;
@@ -61,7 +62,24 @@ public class GlobalExceptionHandler {
         ));
     }
 
-    // ── 404 Not Found ─────────────────────────────────────────────────────────
+    // ── 404 Not Found — missing static resources (favicon.ico, etc.) ──────────
+    // 🧠 NoResourceFoundException is thrown by Spring MVC when the browser
+    // automatically requests /favicon.ico or other static assets that don't
+    // exist in a pure API backend. Before this handler, it fell through to the
+    // generic Exception catch-all which logged a full ERROR stack trace for
+    // every browser tab open — pure noise, no action needed.
+    //
+    // This handler intercepts it silently and returns a clean 404 with no body.
+    // ResponseEntity<Void> → no JSON body → browser ignores it immediately.
+    // log.trace() → only visible at TRACE level, invisible in normal operation.
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<Void> handleNoResourceFound(NoResourceFoundException ex) {
+        log.trace("Static resource not found (expected for API-only server): {}",
+                ex.getResourcePath());
+        return ResponseEntity.notFound().build();
+    }
+
+    // ── 404 Not Found — business entity not found ─────────────────────────────
     @ExceptionHandler(ResourceNotFoundException.class)
     public ResponseEntity<Map<String, Object>> handleNotFound(
             ResourceNotFoundException ex) {

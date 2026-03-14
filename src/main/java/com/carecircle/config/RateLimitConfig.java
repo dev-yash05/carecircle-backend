@@ -28,13 +28,17 @@ import java.time.Duration;
 //       .expirationAfterWrite(...)
 //       .build()
 //
-// Lesson: always verify the API against the EXACT version in pom.xml.
-// Mixing API docs from newer versions is a common source of "cannot find symbol" errors.
+// FIX (Issue 4) — RedisClient lifecycle:
+//   Previously: RedisClient was a local variable inside the @Bean method.
+//   Spring returned the connection but the RedisClient that owns it had no
+//   managed lifecycle — it was never shut down, leaking TCP connections.
 //
-// CONNECTION CODEC:
-// The connection uses RedisCodec.of(StringCodec.UTF8, ByteArrayCodec.INSTANCE)
-// — String keys (human-readable: "rate_limit:userId") + byte[] values (bucket state).
-// This is exactly what the official 8.10.1 reference example shows.
+//   Now: RedisClient is its own @Bean with destroyMethod="shutdown".
+//   Spring calls redisClient.shutdown() on context close, which gracefully
+//   closes all connections before the JVM exits.
+//
+//   destroyMethod="close" on the connection ensures it is closed first,
+//   then the client shuts down — correct teardown order.
 // =============================================================================
 
 @Configuration
@@ -46,18 +50,30 @@ public class RateLimitConfig {
     @Value("${spring.data.redis.port:6379}")
     private int redisPort;
 
-    @Value("${spring.data.redis.password:}") // Add this field
+    @Value("${spring.data.redis.password:}")
     private String redisPassword;
 
-    @Bean
-    public StatefulRedisConnection<String, byte[]> redisConnectionForBucket4j() {
-        // Construct URI with password if it exists
+    // ── FIX (Issue 4): RedisClient as a managed bean ─────────────────────────
+    // destroyMethod="shutdown" → Spring calls redisClient.shutdown() on
+    // application context close. This sends a QUIT to Redis, closes the TCP
+    // socket, and releases the Netty event loop threads cleanly.
+    @Bean(destroyMethod = "shutdown")
+    public RedisClient bucket4jRedisClient() {
         String redisUri = redisPassword.isEmpty()
                 ? String.format("redis://%s:%d", redisHost, redisPort)
                 : String.format("redis://:%s@%s:%d", redisPassword, redisHost, redisPort);
+        return RedisClient.create(redisUri);
+    }
 
-        RedisClient redisClient = RedisClient.create(redisUri);
-        return redisClient.connect(RedisCodec.of(StringCodec.UTF8, ByteArrayCodec.INSTANCE));
+    // destroyMethod="close" → connection is closed before the client shuts down.
+    // Correct teardown order: close connection first, then shutdown client.
+    @Bean(destroyMethod = "close")
+    public StatefulRedisConnection<String, byte[]> redisConnectionForBucket4j(
+            RedisClient bucket4jRedisClient) {
+        // String keys (human-readable: "rate_limit:uuid") + byte[] values (bucket state).
+        // This codec is required by Bucket4j — cannot share with Spring's StringRedisTemplate.
+        return bucket4jRedisClient.connect(
+                RedisCodec.of(StringCodec.UTF8, ByteArrayCodec.INSTANCE));
     }
 
     @Bean

@@ -29,7 +29,8 @@ public class CareCircleOAuth2User implements OAuth2User {
 
     @Override
     public Collection<? extends GrantedAuthority> getAuthorities() {
-        // 🧠 "ROLE_" prefix is required by Spring Security for hasRole() checks
+        // 🧠 "ROLE_" prefix is required by Spring Security for hasRole() checks.
+        // ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_CAREGIVER, ROLE_VIEWER
         return List.of(new SimpleGrantedAuthority("ROLE_" + user.getRole().name()));
     }
 }

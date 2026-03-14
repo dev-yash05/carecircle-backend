@@ -1,5 +1,6 @@
 package com.carecircle.security;
 
+import com.carecircle.config.AppProperties;
 import com.carecircle.domain.organization.Organization;
 import com.carecircle.domain.organization.OrganizationRepository;
 import com.carecircle.domain.user.User;
@@ -14,18 +15,24 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 // =============================================================================
-// 🧠 HOW OAUTH2 WORKS (the part Spring hides from you):
+// 🧠 THE REVISED loadUser() — 4 ORDERED PATHS:
 //
-// 1. User clicks "Login with Google"
-// 2. Spring redirects to Google's auth URL with your client_id
-// 3. User approves → Google redirects back with a one-time "code"
-// 4. Spring exchanges the code for an access token (server-to-server)
-// 5. Spring uses the access token to call Google's userinfo endpoint
-// 6. Google returns: { sub, email, name, picture }
-// 7. THIS METHOD is called with that user data
+// Path 1 — SUPER_ADMIN:
+//   email matches env var SUPER_ADMIN_EMAIL → role=SUPER_ADMIN, no org, no invite.
+//   This check runs first, before any DB lookup beyond email.
 //
-// Our job here: take Google's user data and find/create OUR user in OUR DB.
-// We then return a principal that Spring Security uses for the session.
+// Path 2 — Returning user (normal daily flow):
+//   findByGoogleSubjectId(sub) → found → update profile, return as-is.
+//   This is the hot path — fires on 99% of logins after the first one.
+//
+// Path 3 — Pre-registered member (first login after Admin added them):
+//   findByGoogleSubjectId → not found → findByEmail → found →
+//   link googleSubjectId now, keep role + org that Admin assigned.
+//   This is how CAREGIVER / VIEWER get into an org without self-registering.
+//
+// Path 4 — Brand new user (self-registration):
+//   Neither sub nor email found → create new Organization + ADMIN user.
+//   This is the original flow, unchanged — fires only for genuine new Admins.
 // =============================================================================
 
 @Slf4j
@@ -35,45 +42,99 @@ public class CareCircleOAuth2UserService extends DefaultOAuth2UserService {
 
     private final UserRepository userRepository;
     private final OrganizationRepository organizationRepository;
+    private final AppProperties appProperties;
 
     @Override
     @Transactional
     public OAuth2User loadUser(OAuth2UserRequest userRequest) throws OAuth2AuthenticationException {
-        // 1. Let Spring fetch Google's user profile (calls Google's userinfo API)
+
+        // Let Spring fetch Google's user profile (calls Google's userinfo endpoint)
         OAuth2User oAuth2User = super.loadUser(userRequest);
 
-        // 2. Extract attributes from Google's response
-        String googleSubjectId = oAuth2User.getAttribute("sub");    // Permanent Google ID
-        String email = oAuth2User.getAttribute("email");
-        String name = oAuth2User.getAttribute("name");
-        String avatarUrl = oAuth2User.getAttribute("picture");
+        // Extract the three fields we care about from Google's response
+        String googleSubjectId = oAuth2User.getAttribute("sub");   // Permanent, never changes
+        String email           = oAuth2User.getAttribute("email");
+        String name            = oAuth2User.getAttribute("name");
+        String avatarUrl       = oAuth2User.getAttribute("picture");
 
-        log.info("OAuth2 login attempt for email: {}", email);
+        log.info("OAuth2 login attempt — email: {}", email);
 
-        // 3. Find existing user by Google subject ID (most reliable identifier)
-        //    OR create a new user if first login
-        User user = userRepository.findByGoogleSubjectId(googleSubjectId)
-                .orElseGet(() -> createNewUser(googleSubjectId, email, name, avatarUrl));
+        // ── PATH 1: SUPER_ADMIN ──────────────────────────────────────────────
+        // Checked before any org/role logic. Configured purely via env var.
+        // The superAdminEmail check is case-insensitive for safety.
+        if (!appProperties.getSuperAdminEmail().isBlank()
+                && appProperties.getSuperAdminEmail().equalsIgnoreCase(email)) {
 
-        // 4. Update profile info in case it changed on Google side
-        user.setFullName(name);
-        user.setAvatarUrl(avatarUrl);
-        userRepository.save(user);
+            log.info("SUPER_ADMIN login detected for: {}", email);
 
-        log.info("OAuth2 login successful for user: {}", user.getId());
+            User superAdmin = userRepository.findByEmail(email)
+                    .orElseGet(() -> {
+                        // First time this email logs in — create the SUPER_ADMIN user.
+                        // No org — SUPER_ADMIN is above all organizations.
+                        User u = new User();
+                        u.setEmail(email);
+                        u.setRole(User.Role.SUPER_ADMIN);
+                        u.setActive(true);
+                        return u;
+                    });
 
-        // 5. Return our custom principal that wraps both our User and Google's attributes
-        return new CareCircleOAuth2User(user, oAuth2User.getAttributes());
+            // Always keep profile fresh
+            superAdmin.setGoogleSubjectId(googleSubjectId);
+            superAdmin.setFullName(name);
+            superAdmin.setAvatarUrl(avatarUrl);
+            return new CareCircleOAuth2User(userRepository.save(superAdmin), oAuth2User.getAttributes());
+        }
+
+        // ── PATH 2: Returning user — found by Google sub ─────────────────────
+        // Most common path after first login. The sub never changes even if
+        // the user changes their Gmail address.
+        var bySubject = userRepository.findByGoogleSubjectId(googleSubjectId);
+        if (bySubject.isPresent()) {
+            User user = bySubject.get();
+            // Refresh display name + avatar in case they changed on Google
+            user.setFullName(name);
+            user.setAvatarUrl(avatarUrl);
+            log.info("Returning user login — id: {}, role: {}", user.getId(), user.getRole());
+            return new CareCircleOAuth2User(userRepository.save(user), oAuth2User.getAttributes());
+        }
+
+        // ── PATH 3: Pre-registered member — first login after Admin added them ─
+        // Admin called POST /org/{id}/members with this email + CAREGIVER/VIEWER.
+        // That created a User row with role+org already set, but googleSubjectId=NULL.
+        // Now they log in for the first time — we link the Google identity.
+        var byEmail = userRepository.findByEmail(email);
+        if (byEmail.isPresent()) {
+            User preRegistered = byEmail.get();
+
+            if (!preRegistered.isActive()) {
+                log.warn("Login attempt for deactivated user: {}", email);
+                throw new OAuth2AuthenticationException("Account is deactivated. Contact your administrator.");
+            }
+
+            // Link their Google identity now — sub was null until this moment
+            preRegistered.setGoogleSubjectId(googleSubjectId);
+            preRegistered.setFullName(name);
+            preRegistered.setAvatarUrl(avatarUrl);
+
+            log.info("Pre-registered member first login — email: {}, role: {}, org: {}",
+                    email, preRegistered.getRole(), preRegistered.getOrganization().getId());
+
+            return new CareCircleOAuth2User(userRepository.save(preRegistered), oAuth2User.getAttributes());
+        }
+
+        // ── PATH 4: Brand new user — self-registration as ADMIN ──────────────
+        // No existing record anywhere. Create a fresh org and make them its Admin.
+        // This is the original flow, completely unchanged.
+        log.info("New user self-registration — email: {}", email);
+        User newUser = createNewAdminWithOrg(googleSubjectId, email, name, avatarUrl);
+        return new CareCircleOAuth2User(newUser, oAuth2User.getAttributes());
     }
 
-    private User createNewUser(String googleSubjectId, String email,
-                               String name, String avatarUrl) {
-        log.info("Creating new user for email: {}", email);
-
-        // 🧠 AUTO-CREATE ORGANIZATION for new users:
-        // When someone signs up for the first time, we automatically
-        // create a personal organization for them. They become the ADMIN.
-        // Later they can invite caregivers to their organization.
+    // -------------------------------------------------------------------------
+    // Extracted from the original createNewUser() — logic identical.
+    // -------------------------------------------------------------------------
+    private User createNewAdminWithOrg(String googleSubjectId, String email,
+                                       String name, String avatarUrl) {
         Organization org = new Organization();
         org.setName(name + "'s Care Circle");
         org.setPlanType(Organization.PlanType.FREE);
@@ -85,7 +146,7 @@ public class CareCircleOAuth2UserService extends DefaultOAuth2UserService {
         user.setFullName(name);
         user.setAvatarUrl(avatarUrl);
         user.setOrganization(savedOrg);
-        user.setRole(User.Role.ADMIN);   // First user = Admin of their circle
+        user.setRole(User.Role.ADMIN);
         user.setActive(true);
 
         return userRepository.save(user);

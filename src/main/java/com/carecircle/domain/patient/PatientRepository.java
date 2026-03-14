@@ -40,4 +40,5 @@ public interface PatientRepository extends JpaRepository<Patient, UUID> {
             @Param("orgId") UUID orgId
     );
 
+    long countByOrganizationIdAndActiveTrue(UUID organizationId);
 }

@@ -10,28 +10,9 @@ import org.springframework.stereotype.Service;
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
-
-// =============================================================================
-// 🧠 JWT STRUCTURE (for interviews):
-//
-// A JWT has 3 parts separated by dots:
-// HEADER.PAYLOAD.SIGNATURE
-//
-// Header:  {"alg": "HS256", "typ": "JWT"}
-// Payload: {"sub": "user-uuid", "email": "...", "role": "ADMIN", "exp": 123...}
-// Signature: HMAC-SHA256(base64(header) + "." + base64(payload), secret)
-//
-// The signature is what makes it tamper-proof. If anyone changes the payload,
-// the signature won't match and we reject the token.
-//
-// 🧠 WHY HttpOnly Cookie instead of localStorage?
-// localStorage is accessible by ANY JavaScript on the page.
-// XSS attack = attacker injects JS → reads your token → sends it to their server.
-// HttpOnly cookie = JavaScript CANNOT read it. Only the browser sends it.
-// This is the correct way to store JWTs in 2026.
-// =============================================================================
 
 @Slf4j
 @Service
@@ -40,7 +21,6 @@ public class JwtService {
 
     private final JwtProperties jwtProperties;
 
-    // Generate the signing key from our secret string
     private SecretKey getSigningKey() {
         return Keys.hmacShaKeyFor(
                 jwtProperties.getSecret().getBytes(StandardCharsets.UTF_8)
@@ -48,27 +28,30 @@ public class JwtService {
     }
 
     // -------------------------------------------------------------------------
-    // GENERATE ACCESS TOKEN (short-lived: 15 minutes)
+    // GENERATE ACCESS TOKEN
+    // 🧠 orgId is nullable — SUPER_ADMIN has no organization.
+    //    We store "SUPER_ADMIN" as a literal string in the orgId claim
+    //    so the frontend can check it without a null-pointer crash.
     // -------------------------------------------------------------------------
     public String generateAccessToken(UUID userId, String email, String role, UUID orgId) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("email", email);
+        claims.put("role", role);
+        // Use "SUPER_ADMIN" as a sentinel value when there's no real orgId.
+        // The frontend and JwtAuthFilter both check role first, so this
+        // string will never be parsed as a UUID for SUPER_ADMIN users.
+        claims.put("orgId", orgId != null ? orgId.toString() : "SUPER_ADMIN");
+
         return Jwts.builder()
-                .subject(userId.toString())           // "sub" claim = user ID
-                .claims(Map.of(                        // Custom claims
-                        "email", email,
-                        "role", role,
-                        "orgId", orgId.toString()
-                ))
+                .subject(userId.toString())
+                .claims(claims)
                 .issuedAt(new Date())
                 .expiration(new Date(System.currentTimeMillis() + jwtProperties.getExpiryMs()))
                 .signWith(getSigningKey())
                 .compact();
     }
 
-    // -------------------------------------------------------------------------
-    // GENERATE REFRESH TOKEN (long-lived: 7 days)
-    // -------------------------------------------------------------------------
-    // 🧠 Refresh token has MINIMAL claims — just the user ID.
-    // It's only used to get a new access token, not to authorize requests.
+    // Refresh token — minimal claims, just the user ID
     public String generateRefreshToken(UUID userId) {
         return Jwts.builder()
                 .subject(userId.toString())
@@ -78,9 +61,6 @@ public class JwtService {
                 .compact();
     }
 
-    // -------------------------------------------------------------------------
-    // VALIDATE TOKEN
-    // -------------------------------------------------------------------------
     public boolean isTokenValid(String token) {
         try {
             parseClaims(token);
@@ -99,9 +79,6 @@ public class JwtService {
         return false;
     }
 
-    // -------------------------------------------------------------------------
-    // EXTRACT CLAIMS
-    // -------------------------------------------------------------------------
     private Claims parseClaims(String token) {
         return Jwts.parser()
                 .verifyWith(getSigningKey())
@@ -122,7 +99,11 @@ public class JwtService {
         return parseClaims(token).get("role", String.class);
     }
 
+    // 🧠 Returns null for SUPER_ADMIN (their orgId claim is the sentinel string).
+    // Callers should check role first before calling this.
     public UUID extractOrgId(String token) {
-        return UUID.fromString(parseClaims(token).get("orgId", String.class));
+        String raw = parseClaims(token).get("orgId", String.class);
+        if (raw == null || raw.equals("SUPER_ADMIN")) return null;
+        return UUID.fromString(raw);
     }
 }

@@ -179,6 +179,7 @@ logging:
     console: "%d{HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
 
 app:
+  super-admin-email: ${SUPER_ADMIN_EMAIL:}
   jwt:
     secret: ${JWT_SECRET}
     expiry-ms: ${JWT_EXPIRY_MS}

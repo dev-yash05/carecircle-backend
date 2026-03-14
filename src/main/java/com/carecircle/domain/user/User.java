@@ -10,12 +10,12 @@ import lombok.*;
 @Entity
 @Table(
         name = "users",
-        // 🧠 Composite unique constraint: email must be unique per org,
-        // but the same email CAN exist in different organizations.
-        // This mirrors our schema: CONSTRAINT uq_user_email_per_org
+        // 🧠 Global email uniqueness (changed from per-org in V1).
+        // One real-world person = one account in the system.
+        // Multi-org membership will be handled via a junction table in Sprint 7.
         uniqueConstraints = @UniqueConstraint(
-                name = "uq_user_email_per_org",
-                columnNames = {"organization_id", "email"}
+                name = "uq_user_email_global",
+                columnNames = {"email"}
         )
 )
 @Getter
@@ -24,16 +24,15 @@ import lombok.*;
 @ToString(callSuper = true, exclude = "organization")
 public class User extends BaseEntity {
 
-    // 🧠 @ManyToOne with LAZY loading: Don't fetch the entire Organization
-    // object every time you load a User. Only fetch it when you actually
-    // call user.getOrganization(). This is a massive performance win.
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "organization_id", nullable = false)
+    // 🧠 SUPER_ADMIN has no organization — they are above all orgs.
+    // optional = true + nullable = true lets Hibernate insert a NULL FK.
+    @ManyToOne(fetch = FetchType.LAZY, optional = true)
+    @JoinColumn(name = "organization_id", nullable = true)
     private Organization organization;
 
     @Email
     @NotBlank
-    @Column(nullable = false)
+    @Column(nullable = false, unique = true)
     private String email;
 
     @NotBlank
@@ -43,9 +42,9 @@ public class User extends BaseEntity {
     @Column(name = "avatar_url")
     private String avatarUrl;
 
-    // 🧠 This is the Google "sub" claim — a permanent unique ID for the
-    // Google account. Even if the user changes their Gmail address,
-    // this ID stays the same. We use this to identify returning users.
+    // 🧠 NULLABLE: Pre-registered users (CAREGIVER / VIEWER added by an Admin
+    // before they have ever signed in) have no Google sub yet. It gets filled
+    // in on their very first Google login inside CareCircleOAuth2UserService.
     @Column(name = "google_subject_id", unique = true)
     private String googleSubjectId;
 
@@ -57,6 +56,11 @@ public class User extends BaseEntity {
     private boolean isActive = true;
 
     public enum Role {
-        ADMIN, CAREGIVER, VIEWER
+        // 🧠 Declaration order matters for documentation clarity:
+        // Highest privilege → lowest privilege
+        SUPER_ADMIN,  // You — sees ALL orgs, ALL data. Set via env var, not UI.
+        ADMIN,        // Org owner — creates org, adds members, manages patients/meds.
+        CAREGIVER,    // On-ground — marks doses, records vitals. Cannot edit patients.
+        VIEWER        // Family/remote — read-only. Gets real-time alerts. Zero write access.
     }
 }

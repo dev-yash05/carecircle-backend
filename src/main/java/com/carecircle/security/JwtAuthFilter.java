@@ -35,22 +35,21 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                                     FilterChain filterChain)
             throws ServletException, IOException {
 
-        // 1. Extract access_token from cookies
         String token = extractTokenFromCookie(request);
 
         if (token != null && jwtService.isTokenValid(token)) {
-            // 2. Extract user info from token (no DB call needed — JWT is self-contained)
             UUID userId = jwtService.extractUserId(token);
             String role = jwtService.extractRole(token);
 
-            // 3. Load user from DB to verify they still exist and are active
+            // Load user from DB to verify they still exist and are active.
+            // 🧠 This one DB call per request catches deactivated-mid-session users.
             Optional<User> userOpt = userRepository.findById(userId);
 
             if (userOpt.isPresent() && userOpt.get().isActive()) {
                 User user = userOpt.get();
 
-                // 4. Create authentication object and put in SecurityContext
-                // 🧠 This is what makes @PreAuthorize work downstream
+                // Build the authentication token that Spring Security uses
+                // for @PreAuthorize checks downstream.
                 UsernamePasswordAuthenticationToken auth =
                         new UsernamePasswordAuthenticationToken(
                                 user,
@@ -61,14 +60,13 @@ public class JwtAuthFilter extends OncePerRequestFilter {
             }
         }
 
-        // 5. Always continue the filter chain — security rules applied by SecurityConfig
         filterChain.doFilter(request, response);
     }
 
     private String extractTokenFromCookie(HttpServletRequest request) {
         if (request.getCookies() == null) return null;
         return Arrays.stream(request.getCookies())
-                .filter(cookie -> "access_token".equals(cookie.getName()))
+                .filter(c -> "access_token".equals(c.getName()))
                 .map(Cookie::getValue)
                 .findFirst()
                 .orElse(null);
